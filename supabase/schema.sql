@@ -1,5 +1,5 @@
 -- BUILDMATIC OS V11 - Supabase schema
--- Run once in the Supabase SQL editor.
+-- Safe to re-run. Apply in the Supabase SQL editor.
 
 create table if not exists public.profiles (
   id uuid primary key references auth.users(id) on delete cascade,
@@ -80,18 +80,17 @@ create or replace function public.has_elite_xp() returns boolean
 language sql stable security definer set search_path = ''
 as $$ select coalesce((select xp >= 3000 from public.profiles where id = auth.uid()), false) $$;
 
--- Private tables: only the row owner is allowed to read or mutate it.
+-- Private tables: each user accesses only their own rows.
 drop policy if exists "profiles own select" on public.profiles;
 create policy "profiles own select" on public.profiles for select to authenticated using (id = auth.uid());
 drop policy if exists "profiles own update" on public.profiles;
 create policy "profiles own update" on public.profiles for update to authenticated using (id = auth.uid()) with check (id = auth.uid());
 
-revoke update (xp, id, created_at) on public.profiles from authenticated, anon;
+revoke update on public.profiles from authenticated, anon;
 grant update (name, updated_at) on public.profiles to authenticated;
 
 drop policy if exists "user state own all" on public.user_state;
-create policy "user state own all" on public.user_state for all to authenticated
-using (user_id = auth.uid()) with check (user_id = auth.uid());
+create policy "user state own all" on public.user_state for all to authenticated using (user_id = auth.uid()) with check (user_id = auth.uid());
 
 drop policy if exists "xp events own select" on public.xp_events;
 create policy "xp events own select" on public.xp_events for select to authenticated using (user_id = auth.uid());
@@ -99,7 +98,7 @@ create policy "xp events own select" on public.xp_events for select to authentic
 drop policy if exists "agent usage own select" on public.agent_usage;
 create policy "agent usage own select" on public.agent_usage for select to authenticated using (user_id = auth.uid());
 
--- Shared marketplace: authenticated users read all listings; owners modify only their rows.
+-- Shared marketplace: authenticated users read; each owner manages their own listing.
 drop policy if exists "marketplace authenticated read" on public.marketplace_skills;
 create policy "marketplace authenticated read" on public.marketplace_skills for select to authenticated using (true);
 drop policy if exists "marketplace owner insert" on public.marketplace_skills;
@@ -109,7 +108,7 @@ create policy "marketplace owner update" on public.marketplace_skills for update
 drop policy if exists "marketplace owner delete" on public.marketplace_skills;
 create policy "marketplace owner delete" on public.marketplace_skills for delete to authenticated using (owner_id = auth.uid());
 
--- Shared news: authenticated users read; only the author changes or deletes a post.
+-- Shared news: authenticated users read; author controls their posts.
 drop policy if exists "news authenticated read" on public.dev_news;
 create policy "news authenticated read" on public.dev_news for select to authenticated using (true);
 drop policy if exists "news owner insert" on public.dev_news;
@@ -119,12 +118,11 @@ create policy "news owner update" on public.dev_news for update to authenticated
 drop policy if exists "news owner delete" on public.dev_news;
 create policy "news owner delete" on public.dev_news for delete to authenticated using (author_id = auth.uid());
 
--- Elite conversation is shared among qualifying authenticated users, never anonymous users.
+-- Elite messages are shared only with authenticated eligible members (3000+ XP).
 drop policy if exists "elite qualifying read" on public.elite_messages;
 create policy "elite qualifying read" on public.elite_messages for select to authenticated using (public.has_elite_xp());
 drop policy if exists "elite qualifying insert" on public.elite_messages;
-create policy "elite qualifying insert" on public.elite_messages for insert to authenticated
-with check (user_id = auth.uid() and public.has_elite_xp());
+create policy "elite qualifying insert" on public.elite_messages for insert to authenticated with check (user_id = auth.uid() and public.has_elite_xp());
 
 create or replace function public.handle_new_user()
 returns trigger language plpgsql security definer set search_path = public
@@ -137,36 +135,25 @@ end;
 $$;
 
 drop trigger if exists on_auth_user_created on auth.users;
-create trigger on_auth_user_created after insert on auth.users
-for each row execute function public.handle_new_user();
+create trigger on_auth_user_created after insert on auth.users for each row execute function public.handle_new_user();
 
 create or replace function public.award_xp(p_amount integer, p_reason text default 'app')
 returns integer language plpgsql security definer set search_path = public
 as $$
-declare
-  daily_amount integer;
-  new_xp integer;
+declare daily_amount integer; new_xp integer;
 begin
   if auth.uid() is null then raise exception 'authentication required'; end if;
   if p_amount not between 1 and 50 then raise exception 'invalid XP amount'; end if;
-
-  select coalesce(sum(amount), 0) into daily_amount
-  from public.xp_events
-  where user_id = auth.uid() and created_at > now() - interval '24 hours';
-
+  select coalesce(sum(amount), 0) into daily_amount from public.xp_events
+    where user_id = auth.uid() and created_at > now() - interval '24 hours';
   if daily_amount + p_amount > 500 then
     select xp into new_xp from public.profiles where id = auth.uid();
     return new_xp;
-  end;
-
+  end if;
   insert into public.xp_events(user_id, amount, reason)
-  values (auth.uid(), p_amount, left(coalesce(p_reason, 'app'), 40));
-
-  update public.profiles
-  set xp = xp + p_amount, updated_at = now()
-  where id = auth.uid()
-  returning xp into new_xp;
-
+    values (auth.uid(), p_amount, left(coalesce(p_reason, 'app'), 40));
+  update public.profiles set xp = xp + p_amount, updated_at = now()
+    where id = auth.uid() returning xp into new_xp;
   return new_xp;
 end;
 $$;
@@ -177,9 +164,8 @@ as $$
 declare request_count integer;
 begin
   if auth.uid() is null then raise exception 'authentication required'; end if;
-  select count(*) into request_count
-  from public.agent_usage
-  where user_id = auth.uid() and created_at > now() - interval '24 hours';
+  select count(*) into request_count from public.agent_usage
+    where user_id = auth.uid() and created_at > now() - interval '24 hours';
   if request_count >= 30 then return false; end if;
   insert into public.agent_usage(user_id) values (auth.uid());
   return true;
@@ -190,16 +176,9 @@ create or replace function public.elite_before_insert()
 returns trigger language plpgsql security definer set search_path = public
 as $$
 begin
-  if auth.uid() is null or new.user_id <> auth.uid() then
-    raise exception 'invalid message author';
-  end if;
-  if not public.has_elite_xp() then
-    raise exception 'elite XP required';
-  end if;
-  if exists (
-    select 1 from public.elite_messages
-    where user_id = new.user_id and created_at > now() - interval '2 seconds'
-  ) then
+  if auth.uid() is null or new.user_id <> auth.uid() then raise exception 'invalid message author'; end if;
+  if not public.has_elite_xp() then raise exception 'elite XP required'; end if;
+  if exists (select 1 from public.elite_messages where user_id = new.user_id and created_at > now() - interval '2 seconds') then
     raise exception 'slow down';
   end if;
   select name into new.author from public.profiles where id = new.user_id;
@@ -209,8 +188,7 @@ end;
 $$;
 
 drop trigger if exists elite_guard on public.elite_messages;
-create trigger elite_guard before insert on public.elite_messages
-for each row execute function public.elite_before_insert();
+create trigger elite_guard before insert on public.elite_messages for each row execute function public.elite_before_insert();
 
 create or replace function public.delete_my_account()
 returns void language plpgsql security definer set search_path = public, auth
@@ -221,11 +199,22 @@ begin
 end;
 $$;
 
+-- Sensitive RPCs: no PUBLIC/anon execution; authenticated clients use their own JWT.
 revoke all on function public.award_xp(integer, text) from public, anon;
-grantexecute on function public.award_xp(integer, text) to authenticated;
+grant execute on function public.award_xp(integer, text) to authenticated;
 revoke all on function public.agent_quota_ok() from public, anon;
-grantexecute on function public.agent_quota_ok() to authenticated;
+grant execute on function public.agent_quota_ok() to authenticated;
 revoke all on function public.delete_my_account() from public, anon;
-grantexecute on function public.delete_my_account() to authenticated;
+grant execute on function public.delete_my_account() to authenticated;
 
-alter publication supabase_realtime add table public.elite_messages;
+-- Idempotently enable Realtime for the group chat.
+do $$
+begin
+  if not exists (
+    select 1 from pg_publication_tables
+    where pubname = 'supabase_realtime' and schemaname = 'public' and tablename = 'elite_messages'
+  ) then
+    alter publication supabase_realtime add table public.elite_messages;
+  end if;
+end;
+$$;
